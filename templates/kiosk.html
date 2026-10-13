@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Saraswati Puja Quiz</title>
+  <link rel="stylesheet" href="/static/css/kiosk.css">
+</head>
+<body>
+  <main class="kiosk-shell">
+    <header class="masthead"><div class="lotus" aria-hidden="true">❀</div><div><p class="eyebrow">NAVADURGA • NAVRATRI</p><h1>Saraswati Puja Quiz</h1></div><div class="lotus lotus-right" aria-hidden="true">❀</div></header>
+    <section class="stage">
+      <div class="camera-card">
+        <div class="camera-heading"><span>YOUR HAND ZONE</span><span class="live-dot">LIVE</span></div>
+        <div class="camera-frame"><img src="/video" alt="Mirrored live camera preview with hand landmarks and hand-zone guide"><div class="camera-ring" id="gesture-ring"><span id="gesture-count">✋</span></div></div>
+        <p class="coach" id="coach">Stand in front of the camera</p>
+      </div>
+      <div class="message-card" id="message-card" aria-live="polite">
+        <p class="eyebrow" id="state-label">WELCOME</p>
+        <div id="content" class="content"></div>
+      </div>
+    </section>
+    <footer><span>Show your hands in the frame</span><span class="divider">✦</span><span>Hands-free • Joyful • Learn together</span></footer>
+  </main>
+  <script>window.KIOSK_SIMULATE = {{ "true" if simulate else "false" }};</script>
+  <script src="/static/js/kiosk.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kiosk Volunteer Admin</title><link rel="stylesheet" href="/static/css/admin.css"></head>
+<body>
+  <main>
+    <header><p class="eyebrow">VOLUNTEER CONSOLE</p><h1>Kiosk settings</h1><p>Visitors never need this page. Changes are saved locally to this kiosk.</p></header>
+    <section class="panel"><h2>Gesture and session thresholds</h2><form id="settings"></form><button id="save-settings">Save settings</button><button id="sound-toggle">Toggle sound</button></section>
+    <section class="panel"><h2>Question bank JSON</h2><textarea id="questions" spellcheck="false"></textarea><button data-save="questions">Save questions</button></section>
+    <section class="panel"><h2>Blessing slogans JSON</h2><textarea id="slogans" spellcheck="false"></textarea><button data-save="slogans">Save slogans</button></section>
+    <section class="panel"><h2>Recent activity</h2><div id="activity"></div></section>
+    <section class="panel"><h2>Leaderboard maintenance</h2><div id="entries"></div><button class="danger" id="reset-board">Reset leaderboard</button></section>
+    <p id="notice" role="status"></p>
+  </main>
+  <script src="/static/js/admin.js"></script>
+</body>
+</html>
