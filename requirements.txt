@@ -2,8 +2,6 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 sqlalchemy>=2.0
 jinja2>=3.1
-opencv-python>=4.10
-mediapipe>=0.10.20; python_version < "3.14"
-vosk>=0.3.45
-sounddevice>=0.5
+opencv-python>=4.10,<5
+mediapipe>=0.10.20,<0.10.22; python_version == "3.11"
 pytest>=8.0

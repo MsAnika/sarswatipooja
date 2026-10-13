@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,9 +19,9 @@ from app.voice import sanitize_name
 
 logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "confidence_threshold": 0.75,
-    "hold_ms": 800,
-    "vote_frames": 15,
+    "confidence_threshold": 0.65,
+    "hold_ms": 600,
+    "vote_frames": 8,
     "namaste_distance": 0.35,
     "question_seconds": 20,
     "idle_seconds": 60,
@@ -38,8 +39,8 @@ class QuizState:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.timers_paused = False
-        self.state = "IDLE"
-        self.payload: dict[str, Any] = {}
+        self.state = "NAME"
+        self.payload: dict[str, Any] = {"prompt": "Please say your name"}
         self.version = 0
         self.last_activity = time.monotonic()
         self.deadline: float | None = None
@@ -51,22 +52,20 @@ class QuizState:
         self.selected_answer: int | None = None
         self.feedback_phase = ""
         self.feedback_deadline: float | None = None
-        self.name_attempts = 0
-        self.devotee_count = 1
         self.leaderboard_id: int | None = None
         self.player_rank: int | None = None
         self.previous_player_questions: set[str] = set()
         self.blessing_picker = BlessingPicker()
         self.timeout_count = 0
-        self._voice_capture = None
-        self._voice_thread: threading.Thread | None = None
-        self._voice_generation = 0
         self._settings_changed = None
         self._question_changed = None
         self._gesture_reset = None
         self._timers_paused_at: float | None = None
         self._leaderboard: list[dict[str, Any]] = []
-        self.gesture = {"value": None, "confidence": 0.0, "progress": 0.0, "locked": False}
+        self.gesture = {
+            "value": None, "confidence": 0.0, "progress": 0.0,
+            "locked": False, "awaiting_release": False,
+        }
         self._load_settings()
         self._leaderboard = self.get_leaderboard_from_db()
         self._load_blessing_history()
@@ -77,6 +76,15 @@ class QuizState:
             for key, value in DEFAULT_SETTINGS.items():
                 if db.get(AppSetting, key) is None:
                     db.add(AppSetting(key=key, value=json.dumps(value)))
+            previous_gesture_defaults = {
+                "confidence_threshold": 0.75,
+                "hold_ms": 800,
+                "vote_frames": 15,
+            }
+            for key, old_value in previous_gesture_defaults.items():
+                setting = db.get(AppSetting, key)
+                if setting is not None and json.loads(setting.value) == old_value:
+                    setting.value = json.dumps(DEFAULT_SETTINGS[key])
             db.commit()
             rows = db.scalars(select(AppSetting)).all()
             self.settings = {row.key: json.loads(row.value) for row in rows}
@@ -106,8 +114,8 @@ class QuizState:
                     "name": self.player,
                     "question": self.question_index + 1 if self.state in {"QUESTION", "FEEDBACK"} else 0,
                     "total": 5,
-                    "active": self.state not in {"IDLE", "BLESSING"},
-                    "idle": self.state == "IDLE",
+                    "active": self.state not in {"NAME", "BLESSING"},
+                    "idle": self.state == "NAME",
                 },
             }
 
@@ -149,11 +157,9 @@ class QuizState:
             if self.timers_paused:
                 return
             now = time.monotonic() if now is None else now
-            if self.state != "IDLE" and now - self.last_activity >= self.settings["idle_seconds"]:
+            if self.state != "NAME" and now - self.last_activity >= self.settings["idle_seconds"]:
                 self._timeout("idle_reset")
                 self.reset()
-            elif self.state == "HOWTO" and self.deadline is not None and now >= self.deadline:
-                self._show_question()
             elif self.state == "QUESTION" and self.deadline is not None and now >= self.deadline:
                 self._timeout("question_timeout")
                 self._record_answer(None, timed_out=True)
@@ -172,13 +178,6 @@ class QuizState:
                 self._reveal_blessing()
             elif self.state == "BLESSING" and self.deadline is not None and now >= self.deadline:
                 self.reset()
-            elif self.state == "NAME" and not self.simulate and self._voice_capture is not None and self._voice_thread is None:
-                self._voice_thread = threading.Thread(target=self._capture_name, name="voice-name", daemon=True)
-                self._voice_thread.start()
-
-    def set_voice_capture(self, voice_capture) -> None:
-        self._voice_capture = voice_capture
-
     def set_settings_changed(self, callback) -> None:
         self._settings_changed = callback
 
@@ -187,25 +186,6 @@ class QuizState:
 
     def set_gesture_reset(self, callback) -> None:
         self._gesture_reset = callback
-
-    def _capture_name(self) -> None:
-        generation = self._voice_generation
-        try:
-            recognized = self._voice_capture.capture(4)
-            with self._lock:
-                if generation == self._voice_generation and self.state == "NAME":
-                    self.accept_name(recognized)
-        except (RuntimeError, ValueError) as exc:
-            logger.warning("Name capture failed: %s", exc)
-            with self._lock:
-                if generation == self._voice_generation and self.state == "NAME":
-                    self._retry_name()
-                    if self.state == "NAME":
-                        self.payload["voice_error"] = str(exc)
-                    self._publish()
-        finally:
-            with self._lock:
-                self._voice_thread = None
 
     def _timeout(self, reason: str) -> None:
         self.timeout_count += 1
@@ -221,18 +201,17 @@ class QuizState:
         confidence: float = 1.0,
         progress: float = 1.0,
         locked: bool = True,
+        awaiting_release: bool = False,
     ) -> None:
         with self._lock:
             now = time.monotonic()
             self.gesture = {"value": count if event == "count" else event, "confidence": confidence,
-                            "progress": progress, "locked": locked}
+                            "progress": progress, "locked": locked, "awaiting_release": awaiting_release}
             if event == "status":
                 self._publish()
                 return
             if event == "count":
-                if self.state == "IDLE" and count == 5 and locked:
-                    self._start_name()
-                elif self.state == "NAME" and locked:
+                if self.state == "NAME" and locked:
                     if count == 1:
                         self._confirm_name()
                     elif count == 2:
@@ -245,23 +224,6 @@ class QuizState:
             if locked and ((event == "namaste") or (event == "count" and count in (1, 2, 3, 4, 5))):
                 self.last_activity = now
             self._publish()
-
-    def _start_name(self) -> None:
-        if self.state != "IDLE":
-            return
-        if self._gesture_reset:
-            self._gesture_reset()
-        self.player = ""
-        self.name_attempts = 0
-        self.answers = []
-        self.question_index = 0
-        self.selected_answer = None
-        self.payload = {"prompt": "Please say your name", "attempt": 1}
-        self.state = "NAME"
-        self.deadline = None
-        self._voice_generation += 1
-        self._voice_thread = None
-        logger.info("Visitor started name capture")
 
     def accept_name(self, raw_name: str) -> str:
         with self._lock:
@@ -276,33 +238,24 @@ class QuizState:
                 self._retry_name()
                 raise ValueError("Please say your name again.")
             self.player = name
-            self.payload = {"name": name, "prompt": f"Is your name {name}?", "confirm_with": "1 = yes, 2 = say it again"}
+            self.payload = {
+                "name": name,
+                "prompt": f"Is your name {name}?",
+                "confirm_with": "1 = yes, 2 = say it again",
+            }
             self.last_activity = time.monotonic()
             self._publish()
             return name
 
     def _retry_name(self) -> None:
-        self.name_attempts += 1
-        if self.name_attempts >= 2:
-            self.player = f"Devotee {self.devotee_count}"
-            self.devotee_count += 1
-            self.payload = {"name": self.player, "prompt": f"Welcome, {self.player}"}
-            self._begin_howto()
-        else:
-            self.player = ""
-            self.payload = {"prompt": "Please say your name again", "attempt": self.name_attempts + 1}
+        if self._gesture_reset:
+            self._gesture_reset()
+        self.player = ""
+        self.payload = {"prompt": "Please say your name"}
 
     def _confirm_name(self) -> None:
         if self.player:
-            self._begin_howto()
-
-    def _begin_howto(self) -> None:
-        if self._gesture_reset:
-            self._gesture_reset()
-        self.state = "HOWTO"
-        self.payload = {"name": self.player, "prompt": "Answer with 1, 2, 3 or 4 fingers"}
-        self.deadline = time.monotonic() + 3
-        self.last_activity = time.monotonic()
+            self._show_question()
 
     def _choose_questions(self) -> list[dict[str, Any]]:
         questions = [q for q in load_json("questions.json") if q.get("active", True)]
@@ -396,6 +349,8 @@ class QuizState:
             self._finish_quiz()
 
     def _finish_quiz(self) -> None:
+        if not self.player:
+            raise RuntimeError("Cannot save a quiz without a confirmed player name.")
         score = sum(answer["points"] for answer in self.answers)
         answer_time = sum(answer["elapsed"] for answer in self.answers)
         with SessionLocal() as db:
@@ -431,20 +386,24 @@ class QuizState:
 
     def reset(self) -> None:
         with self._lock:
-            self.state = "IDLE"
+            if self._gesture_reset:
+                self._gesture_reset()
+            self.state = "NAME"
             self.timers_paused = False
-            self._voice_generation += 1
-            self.payload = {}
+            self.payload = {"prompt": "Please say your name"}
             self.deadline = None
             self.feedback_deadline = None
             self.questions = []
             self.answers = []
             self.player = ""
             self.selected_answer = None
-            self.gesture = {"value": None, "confidence": 0.0, "progress": 0.0, "locked": False}
+            self.gesture = {
+                "value": None, "confidence": 0.0, "progress": 0.0,
+                "locked": False, "awaiting_release": False,
+            }
             self.last_activity = time.monotonic()
             self._publish()
-            logger.info("Kiosk reset to IDLE")
+            logger.info("Kiosk reset; ready to capture the next player's name")
 
     def skip_question(self) -> None:
         with self._lock:
@@ -459,6 +418,7 @@ class QuizState:
         return leaderboard_order([
             {"id": item.id, "name": item.name, "score": item.score, "answer_time": item.answer_time,
              "finished_at": item.finished_at.isoformat()} for item in entries
+            if item.name.strip() and not re.fullmatch(r"Devotee \d+", item.name)
         ])
 
     def get_leaderboard_from_db(self) -> list[dict[str, Any]]:

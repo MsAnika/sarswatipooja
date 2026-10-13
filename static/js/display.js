@@ -25,7 +25,7 @@
       podium.innerHTML = positions.map((entry, index) => entry ? `<div class="podium-item ${classes[index]}"><div class="medal">${medals[index]}</div><div class="podium-name">${html(entry.name)}</div><div class="podium-score">${entry.score} pts</div></div>` : "").join("");
     }
     const now = snapshot.now_playing || {};
-    const playing = now.active ? html(now.name) : "Welcome! Show an open palm to begin";
+    const playing = now.active ? html(now.name) : "Welcome! Say your name to begin";
     document.getElementById("playing-text").textContent = playing;
     document.getElementById("playing-progress").textContent = now.active ? `Question ${now.question || 0} / ${now.total || 5}` : "";
     podium.hidden = !now.idle;

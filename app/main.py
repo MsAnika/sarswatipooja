@@ -23,7 +23,6 @@ from app.models import BlessingLog, GestureTimeout, QuizSession
 logger = logging.getLogger(__name__)
 state = None
 camera = None
-voice = None
 
 
 @asynccontextmanager
@@ -45,10 +44,9 @@ templates = Jinja2Templates(directory=ROOT / "templates")
 security = HTTPBasic()
 
 
-def configure_runtime(quiz_state, camera_worker, voice_capture) -> None:
-    global state, camera, voice
-    state, camera, voice = quiz_state, camera_worker, voice_capture
-    state.set_voice_capture(voice_capture)
+def configure_runtime(quiz_state, camera_worker) -> None:
+    global state, camera
+    state, camera = quiz_state, camera_worker
     camera.configure(state.settings)
     state.set_settings_changed(camera.configure)
     state.set_question_changed(camera.reset_locks)
@@ -95,6 +93,13 @@ async def get_state() -> dict[str, Any]:
     return current_state().snapshot()
 
 
+@app.get("/api/camera/status")
+async def camera_status() -> dict[str, str]:
+    if camera is None:
+        raise HTTPException(status_code=503, detail="Camera worker is not configured.")
+    return {"status": camera.status}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -138,14 +143,42 @@ async def goddess_image(filename: str) -> Response:
     if path.is_file():
         return Response(path.read_bytes(), media_type="image/png")
     goddess_name = known[filename]
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900">
-    <rect x="20" y="20" width="860" height="860" rx="36" fill="#fff7e8" stroke="#c89a43" stroke-width="8"/>
-    <text x="450" y="440" text-anchor="middle" font-family="Georgia,serif" font-size="60" fill="#7b2936">{goddess_name}</text>
-    <text x="450" y="510" text-anchor="middle" font-family="sans-serif" font-size="25" fill="#644b3e">Add your supplied image here</text></svg>"""
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900" role="img" aria-labelledby="title description">
+    <title id="title">Goddess {goddess_name}</title>
+    <desc id="description">A warm, original illustration of a goddess seated on a lotus beneath a radiant halo.</desc>
+    <defs>
+      <radialGradient id="background"><stop stop-color="#fff9e9"/><stop offset="1" stop-color="#efd49a"/></radialGradient>
+      <linearGradient id="sari" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#b52d47"/><stop offset="1" stop-color="#e77c42"/></linearGradient>
+      <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#ffe89a"/><stop offset="1" stop-color="#d99c32"/></linearGradient>
+    </defs>
+    <rect width="900" height="900" rx="44" fill="url(#background)"/>
+    <circle cx="450" cy="382" r="292" fill="#f5cf69" opacity=".34"/>
+    <circle cx="450" cy="382" r="246" fill="none" stroke="#d39b36" stroke-width="5" stroke-dasharray="3 18"/>
+    <path d="M450 106v48m0 456v48M174 382h48m456 0h48M255 187l34 34m322 322 34 34m0-390-34 34m-322 322-34 34" stroke="#d39b36" stroke-width="7" stroke-linecap="round" opacity=".72"/>
+    <path d="M280 690q-90-64-118 6 68 40 118-6m340 0q90-64 118 6-68 40-118-6" fill="#d95671" stroke="#9e2945" stroke-width="7"/>
+    <path d="M340 701q-83-105-112-36 57 67 112 36m220 0q83-105 112-36-57 67-112 36" fill="#ef9aa0" stroke="#b63b50" stroke-width="7"/>
+    <path d="M450 704q-82-126 0-162 82 36 0 162" fill="#ffe4a2" stroke="#bf8431" stroke-width="7"/>
+    <path d="M337 555q-58-55-97 7l108 142m215-149q58-55 97 7L552 704" fill="none" stroke="#bd7e54" stroke-width="32" stroke-linecap="round"/>
+    <path d="M290 578q-25 22-41 45m361-45q25 22 41 45" fill="none" stroke="#f4c596" stroke-width="25" stroke-linecap="round"/>
+    <path d="M329 548q121-102 242 0l74 207q-195 104-390 0z" fill="url(#sari)" stroke="#8f263e" stroke-width="8"/>
+    <path d="M350 573q100 78 200 0m-190 68q90 55 180 0m-160 67q70 38 140 0" fill="none" stroke="#f8d779" stroke-width="8" opacity=".9"/>
+    <path d="M419 473h62v70h-62z" fill="#efbd8d"/>
+    <path d="M373 347q-12-102 77-114 91 17 77 114l-16 98q-61 76-122 0z" fill="#38222a"/>
+    <ellipse cx="450" cy="357" rx="69" ry="86" fill="#f4c99b"/>
+    <path d="M385 337q6-104 65-104t65 104q-26-39-65-44-39 5-65 44" fill="#38222a"/>
+    <path d="M393 272l57-94 57 94q-56-24-114 0" fill="url(#gold)" stroke="#a76e25" stroke-width="8"/>
+    <circle cx="450" cy="198" r="16" fill="#a92542"/><circle cx="450" cy="357" r="7" fill="#a92542"/>
+    <path d="M418 357q13-13 26 0m13 0q13-13 26 0" fill="none" stroke="#542a2d" stroke-width="5" stroke-linecap="round"/>
+    <path d="M444 391q6 5 12 0" fill="none" stroke="#a54b4d" stroke-width="5" stroke-linecap="round"/>
+    <path d="M386 447q64 46 128 0" fill="none" stroke="url(#gold)" stroke-width="12"/>
+    <circle cx="411" cy="464" r="10" fill="#f8dc82"/><circle cx="489" cy="464" r="10" fill="#f8dc82"/>
+    <text x="450" y="838" text-anchor="middle" font-family="Georgia,serif" font-size="43" font-weight="bold" fill="#7b2936">{goddess_name}</text>
+    <text x="450" y="878" text-anchor="middle" font-family="sans-serif" font-size="20" letter-spacing="5" fill="#765135">NAVADURGA • WISDOM • GRACE</text>
+    </svg>"""
     return Response(svg, media_type="image/svg+xml")
 
 
-class DevName(BaseModel):
+class PlayerName(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
@@ -161,7 +194,17 @@ def require_simulation() -> Any:
 
 
 @app.post("/api/dev/name")
-async def dev_name(body: DevName, quiz_state=Depends(require_simulation)) -> dict[str, str]:
+async def dev_name(body: PlayerName, quiz_state=Depends(require_simulation)) -> dict[str, str]:
+    try:
+        name = quiz_state.accept_name(body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"name": name}
+
+
+@app.post("/api/name")
+async def capture_player_name(body: PlayerName) -> dict[str, str]:
+    quiz_state = current_state()
     try:
         name = quiz_state.accept_name(body.name)
     except ValueError as exc:
@@ -182,8 +225,6 @@ def apply_volunteer_action(action_value: str, quiz_state) -> dict[str, str]:
         quiz_state.set_timers_paused(False)
     elif action == "reset":
         quiz_state.reset()
-    elif action == "palm":
-        quiz_state.handle_gesture("count", count=5, confidence=1, progress=1, locked=True)
     elif action in {"1", "2", "3", "4"}:
         quiz_state.handle_gesture("count", count=int(action), confidence=1, progress=1, locked=True)
     elif action == "namaste":

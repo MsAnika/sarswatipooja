@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 import time
 from collections import Counter, deque
@@ -17,15 +18,38 @@ def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def frame_is_too_dark(frame) -> bool:
+    return float(frame.mean()) < 8
+
+
+def hand_inside_guide(wrist: tuple[float, float]) -> bool:
+    return 0.05 <= wrist[0] <= 0.95 and 0.05 <= wrist[1] <= 0.98
+
+
+def _joint_alignment(mcp: tuple[float, float], pip: tuple[float, float], tip: tuple[float, float]) -> float:
+    proximal = (pip[0] - mcp[0], pip[1] - mcp[1])
+    distal = (tip[0] - pip[0], tip[1] - pip[1])
+    lengths = math.hypot(*proximal) * math.hypot(*distal)
+    if lengths == 0:
+        return -1.0
+    return (proximal[0] * distal[0] + proximal[1] * distal[1]) / lengths
+
+
 def count_fingers(points: Iterable[tuple[float, float]]) -> int:
-    """Count fingers by radial joint distances, independent of hand rotation."""
+    """Count extended fingers using both fingertip reach and finger-joint alignment."""
     landmarks = list(points)
     if len(landmarks) < 21:
         raise ValueError("At least 21 hand landmarks are required")
     wrist = landmarks[0]
-    count = sum(distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist) for tip, pip in FINGER_JOINTS)
-    pinky_mcp = landmarks[17]
-    count += distance(landmarks[4], pinky_mcp) > distance(landmarks[3], pinky_mcp)
+    finger_mcps = (5, 9, 13, 17)
+    count = sum(
+        _joint_alignment(landmarks[mcp], landmarks[pip], landmarks[tip]) > 0.2
+        and distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist) * 1.04
+        for (tip, pip), mcp in zip(FINGER_JOINTS, finger_mcps)
+    )
+    thumb_is_straight = _joint_alignment(landmarks[2], landmarks[3], landmarks[4]) > 0.2
+    thumb_is_away_from_palm = distance(landmarks[4], landmarks[5]) > distance(landmarks[3], landmarks[5]) * 1.15
+    count += thumb_is_straight and thumb_is_away_from_palm
     return int(count)
 
 
@@ -48,6 +72,7 @@ class LockUpdate:
     confidence: float
     progress: float
     locked: bool
+    awaiting_release: bool = False
 
 
 class GestureLock:
@@ -59,17 +84,38 @@ class GestureLock:
         self.candidate: int | None = None
         self.started: float | None = None
         self.locked = False
+        self.waiting_for_release = False
 
     def reset(self) -> None:
         self.votes.clear()
         self.candidate = None
         self.started = None
         self.locked = False
+        self.waiting_for_release = False
 
-    def update(self, value: int | None, score: float = 1.0, now: float | None = None) -> LockUpdate:
+    def require_release(self) -> None:
+        self.reset()
+        self.waiting_for_release = True
+
+    def update(
+        self,
+        value: int | None,
+        score: float = 1.0,
+        now: float | None = None,
+        *,
+        hand_present: bool | None = None,
+    ) -> LockUpdate:
         now = time.monotonic() if now is None else now
+        hand_present = value is not None if hand_present is None else hand_present
+        if self.waiting_for_release:
+            if not hand_present:
+                self.reset()
+                return LockUpdate(None, 0.0, 0.0, False)
+            return LockUpdate(value, 0.0, 0.0, False, awaiting_release=True)
         if self.locked:
-            return LockUpdate(value, 0.0, 1.0, False)
+            if value is not None and value == self.candidate:
+                return LockUpdate(value, 1.0, 1.0, False)
+            self.reset()
         if value is None:
             self.reset()
             return LockUpdate(None, 0.0, 0.0, False)
@@ -85,8 +131,9 @@ class GestureLock:
             return LockUpdate(most_common, confidence, 0.0, False)
         if self.started is None:
             self.started = now
-        progress = min(1.0, max(0.0, (now - self.started) / self.hold_seconds))
-        locked = progress >= 1.0
+        elapsed = max(0.0, now - self.started)
+        locked = elapsed + 1e-9 >= self.hold_seconds
+        progress = 1.0 if locked else min(1.0, elapsed / self.hold_seconds)
         self.locked = locked
         return LockUpdate(most_common, confidence, progress, locked)
 
@@ -104,8 +151,8 @@ class CameraWorker:
         self._stop = threading.Event()
         self.latest_jpeg: bytes | None = None
         self.status = "Simulation mode" if not enabled else "Starting camera..."
-        self.lock = GestureLock()
-        self.namaste_lock = GestureLock()
+        self.lock = GestureLock(window=8, min_confidence=0.65, hold_seconds=0.6)
+        self.namaste_lock = GestureLock(window=8, min_confidence=0.65, hold_seconds=0.6)
         self.namaste_distance = 0.35
 
     def configure(self, settings: dict[str, float | int]) -> None:
@@ -122,8 +169,8 @@ class CameraWorker:
         self.namaste_distance = float(settings["namaste_distance"])
 
     def reset_locks(self) -> None:
-        self.lock.reset()
-        self.namaste_lock.reset()
+        self.lock.require_release()
+        self.namaste_lock.require_release()
 
     def start(self) -> None:
         if self.enabled and (self._thread is None or not self._thread.is_alive()):
@@ -138,61 +185,122 @@ class CameraWorker:
     def _run(self) -> None:
         try:
             import cv2
+        except ImportError:
+            self.status = "Camera unavailable: install the OpenCV dependency."
+            logger.exception("OpenCV could not be loaded")
+            return
+        try:
             import mediapipe as mp
         except ImportError:
-            self.status = "Camera recognition unavailable. Install OpenCV and MediaPipe."
+            version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            self.status = (
+                f"Hand tracking unavailable: MediaPipe is not installed for Python {version}. "
+                "Use Python 3.11 and install requirements.txt."
+            )
             logger.exception("Camera dependencies could not be loaded")
+            return
+        if not hasattr(mp, "solutions"):
+            self.status = (
+                f"Hand tracking unavailable: MediaPipe {mp.__version__} does not include the Hands API. "
+                "Use Python 3.11 and reinstall requirements.txt."
+            )
+            logger.error("Incompatible MediaPipe version %s", mp.__version__)
             return
 
         while not self._stop.is_set():
-            capture = cv2.VideoCapture(self.device)
-            capture.set(cv2.CAP_PROP_FPS, 30)
+            capture = self._open_capture(cv2)
             if not capture.isOpened():
-                self.status = "Camera not found. Retrying..."
+                self.status = f"Camera {self.device} not found or unavailable. Retrying..."
                 logger.warning("Unable to open camera %s; retrying", self.device)
                 capture.release()
                 self._stop.wait(2)
                 continue
-            self.status = "Camera connected"
-            hands_api = mp.solutions.hands
-            with hands_api.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6) as hands:
-                while not self._stop.is_set():
-                    started = time.perf_counter()
-                    ok, frame = capture.read()
-                    if not ok:
-                        self.status = "Camera disconnected. Retrying..."
-                        break
-                    frame = cv2.flip(frame, 1)
-                    height, width = frame.shape[:2]
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = hands.process(rgb)
-                    detected: list[tuple[list[tuple[float, float]], float]] = []
-                    if results.multi_hand_landmarks:
-                        for index, hand in enumerate(results.multi_hand_landmarks):
-                            points = [(p.x, p.y) for p in hand.landmark]
-                            if 0.18 <= points[0][0] <= 0.82 and 0.10 <= points[0][1] <= 0.90:
-                                score = results.multi_handedness[index].classification[0].score
-                                detected.append((points, score))
-                            mp.solutions.drawing_utils.draw_landmarks(frame, hand, hands_api.HAND_CONNECTIONS)
-                    cv2.rectangle(frame, (int(width * 0.18), int(height * 0.1)), (int(width * 0.82), int(height * 0.9)), (0, 190, 255), 2)
-                    if len(detected) >= 2 and namaste_detected([item[0] for item in detected], self.namaste_distance):
-                        self.lock.update(None)
-                        update = self.namaste_lock.update(1, min(item[1] for item in detected))
-                        self.on_gesture("namaste", confidence=update.confidence, progress=update.progress, locked=update.locked)
-                    elif detected:
-                        self.namaste_lock.update(None)
-                        points, score = max(detected, key=lambda item: distance(item[0][0], item[0][9]))
-                        count = count_fingers(points)
-                        update = self.lock.update(count, score)
-                        self.on_gesture("count", count=count, confidence=update.confidence, progress=update.progress, locked=update.locked)
-                    else:
-                        self.lock.update(None)
-                        self.namaste_lock.update(None)
-                        self.on_gesture("count", count=None, confidence=0, progress=0, locked=False)
-                    _, encoded = cv2.imencode(".jpg", frame)
-                    self.latest_jpeg = encoded.tobytes()
-                    elapsed = time.perf_counter() - started
-                    if elapsed < 1 / 30:
-                        self._stop.wait(1 / 30 - elapsed)
-            capture.release()
+            self.status = "Camera connected — looking for a hand"
+            try:
+                hands_api = mp.solutions.hands
+                with hands_api.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6) as hands:
+                    while not self._stop.is_set():
+                        started = time.perf_counter()
+                        ok, frame = capture.read()
+                        if not ok:
+                            self.status = "Camera disconnected. Retrying..."
+                            logger.warning("Camera %s stopped returning frames", self.device)
+                            break
+                        frame = cv2.flip(frame, 1)
+                        height, width = frame.shape[:2]
+                        if frame_is_too_dark(frame):
+                            self.lock.update(None)
+                            self.namaste_lock.update(None)
+                            self.status = "Camera image is black or too dark. Check its cover, permissions, lighting, or device index."
+                            self.on_gesture("count", count=None, confidence=0, progress=0, locked=False)
+                        else:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            results = hands.process(rgb)
+                            detected: list[tuple[list[tuple[float, float]], float]] = []
+                            if results.multi_hand_landmarks:
+                                for index, hand in enumerate(results.multi_hand_landmarks):
+                                    points = [(p.x, p.y) for p in hand.landmark]
+                                    if hand_inside_guide(points[0]):
+                                        score = results.multi_handedness[index].classification[0].score
+                                        detected.append((points, score))
+                                    mp.solutions.drawing_utils.draw_landmarks(frame, hand, hands_api.HAND_CONNECTIONS)
+                            if len(detected) >= 2 and namaste_detected([item[0] for item in detected], self.namaste_distance):
+                                self.lock.update(None, hand_present=True)
+                                update = self.namaste_lock.update(1, min(item[1] for item in detected))
+                                self.status = "Namaste detected — hold still"
+                                self.on_gesture("namaste", confidence=update.confidence, progress=update.progress, locked=update.locked,
+                                                awaiting_release=update.awaiting_release)
+                            elif detected:
+                                self.namaste_lock.update(None, hand_present=True)
+                                points, score = max(detected, key=lambda item: distance(item[0][0], item[0][9]))
+                                count = count_fingers(points)
+                                update = self.lock.update(count, score)
+                                self.status = f"Hand detected — {count} finger{'s' if count != 1 else ''}"
+                                self.on_gesture("count", count=count, confidence=update.confidence, progress=update.progress, locked=update.locked,
+                                                awaiting_release=update.awaiting_release)
+                            else:
+                                self.lock.update(None)
+                                self.namaste_lock.update(None)
+                                self.status = "Camera connected — show your hand inside the guide"
+                                self.on_gesture("count", count=None, confidence=0, progress=0, locked=False)
+                        cv2.rectangle(frame, (int(width * 0.05), int(height * 0.05)), (int(width * 0.95), int(height * 0.98)), (0, 190, 255), 2)
+                        cv2.putText(
+                            frame,
+                            self.status,
+                            (18, height - 18),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        _, encoded = cv2.imencode(".jpg", frame)
+                        self.latest_jpeg = encoded.tobytes()
+                        elapsed = time.perf_counter() - started
+                        if elapsed < 1 / 30:
+                            self._stop.wait(1 / 30 - elapsed)
+            except Exception as exc:
+                self.status = f"Hand tracking failed: {exc}"
+                logger.exception("Camera hand tracking failed")
+                self._stop.wait(2)
+            finally:
+                capture.release()
         self.status = "Camera stopped"
+
+    def _open_capture(self, cv2):
+        backends = [None]
+        if sys.platform == "win32":
+            backends.extend((cv2.CAP_DSHOW, cv2.CAP_MSMF))
+        for backend in backends:
+            capture = cv2.VideoCapture(self.device) if backend is None else cv2.VideoCapture(self.device, backend)
+            if capture.isOpened():
+                capture.set(cv2.CAP_PROP_FPS, 30)
+                for _ in range(3):
+                    ok, _frame = capture.read()
+                    if ok:
+                        return capture
+                    if self._stop.wait(0.1):
+                        break
+            capture.release()
+        logger.warning("Camera %s did not return frames from any available backend", self.device)
+        return cv2.VideoCapture()
